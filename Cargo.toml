@@ -1,0 +1,16 @@
+[package]
+name = "mesh-streaming"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+winit = "0.28"
+wgpu = "0.16"
+
+flexi_logger = { version = "0.25", features = ["colors"] }
+log = "0.4"
+
+anyhow = "1.0"
+pollster = "0.3"
