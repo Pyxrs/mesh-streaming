@@ -1,52 +1,32 @@
-use std::iter;
-
 use flexi_logger::Logger;
 use log::*;
 
-use pollster::block_on;
+use wgpu::{Surface, PowerPreference, Backends, Dx12Compiler, SurfaceConfiguration, TextureUsages, Device, Queue, SurfaceError, Features, Limits};
+use wgpu_util::{WgpuSettings, init_wgpu};
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
 
+mod octree;
+mod static_octree;
+mod render;
+mod wgpu_util;
+
 struct State {
-    surface: wgpu::Surface,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    surface: Surface,
+    device: Device,
+    queue: Queue,
+    config: SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     window: Window,
 }
 
 impl State {
-    fn new(window: Window) -> Self {
+    fn new(window: Window, settings: WgpuSettings) -> Self {
         let size = window.inner_size();
-
-        // Use all backends
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            dx12_shader_compiler: Default::default(),
-        });
-
-        let surface = unsafe { instance.create_surface(&window) }.unwrap();
-
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .unwrap();
-
-        let (device, queue) = block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                features: wgpu::Features::empty(),
-                limits: wgpu::Limits::default(),
-            },
-            None,
-        ))
-        .unwrap();
+        let (_instance, surface, adapter, device, queue) = init_wgpu(&window, settings);
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -56,8 +36,8 @@ impl State {
             .filter(|f| f.is_srgb())
             .next()
             .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        let config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width,
             height: size.height,
@@ -95,58 +75,12 @@ impl State {
     }
 
     fn update(&mut self) {}
-
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        // Begin render pass
-        {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-        }
-        // End render pass
-
-        self.queue.submit(iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
-    }
 }
 
 fn main() {
     init_logger(Level::Info).unwrap();
 
-    let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
-
-    let mut state = State::new(window);
-    
-    info!("Test");
-
+    let (event_loop, mut state) = init_window(|w| w);
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent {
@@ -155,22 +89,9 @@ fn main() {
             } if window_id == state.window().id() => {
                 if !state.input(event) {
                     match event {
-                        WindowEvent::CloseRequested
-                        | WindowEvent::KeyboardInput {
-                            input:
-                                KeyboardInput {
-                                    state: ElementState::Pressed,
-                                    virtual_keycode: Some(VirtualKeyCode::Escape),
-                                    ..
-                                },
-                            ..
-                        } => *control_flow = ControlFlow::Exit,
-                        WindowEvent::Resized(physical_size) => {
-                            state.resize(*physical_size);
-                        }
-                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                            state.resize(**new_inner_size);
-                        }
+                        WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                        WindowEvent::Resized(physical_size) => state.resize(*physical_size),
+                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => state.resize(**new_inner_size),
                         _ => {}
                     }
                 }
@@ -179,16 +100,12 @@ fn main() {
                 state.update();
                 match state.render() {
                     Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        state.resize(state.size)
-                    }
-                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                    Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
+                    Err(SurfaceError::Lost | SurfaceError::Outdated) => state.resize(state.size),
+                    Err(SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                    Err(SurfaceError::Timeout) => log::warn!("Surface timeout"),
                 }
             }
-            Event::RedrawEventsCleared => {
-                state.window().request_redraw();
-            }
+            Event::RedrawEventsCleared => state.window().request_redraw(),
             _ => {}
         }
     });
@@ -197,4 +114,19 @@ fn main() {
 fn init_logger(level: Level) -> anyhow::Result<()> {
     Logger::try_with_env_or_str(level.as_str())?.start()?;
     anyhow::Ok(())
+}
+
+fn init_window<W>(window_builder: W) -> (EventLoop<()>, State) where W: FnOnce(WindowBuilder) -> WindowBuilder {
+    let event_loop = EventLoop::new();
+    let window: Window = window_builder(WindowBuilder::new()).build(&event_loop).unwrap();
+    
+    let settings = WgpuSettings(
+        Backends::all(),
+        Dx12Compiler::Fxc,
+        PowerPreference::HighPerformance,
+        Features::empty(),
+        Limits::default()
+    );
+
+    (event_loop, State::new(window, settings))
 }
